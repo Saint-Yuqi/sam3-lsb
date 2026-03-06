@@ -3,62 +3,87 @@ defaults:
   - _self_
 
 # ============================================================================
-# Paths Configuration (Chage this to your own paths)
+# Paths Configuration
 # ============================================================================
 paths:
-  roboflow_vl_100_root: <YOUR_DATASET_DIR>
-  experiment_log_dir: <YOUR EXPERIMENET LOG_DIR>
-  bpe_path: <BPE_PATH> # This should be under sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  roboflow_vl_100_root: /home/yuqyan/Yuqi/LSB-AI-Detection/data/02_processed/sam3_prepared
+  experiment_log_dir: /home/yuqyan/Yuqi/sam3/scratch/sam3_finetuning_${now:%Y-%m-%d_%H-%M-%S}
+  bpe_path: /home/yuqyan/Yuqi/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
-# Roboflow dataset configuration
+# ============================================================================
+# Dataset configuration (LSB baseline)
+# ============================================================================
 roboflow_train:
-  num_images: 100 # Note: This is the number of images used for training. If null, all images are used.
-  supercategory: ${all_roboflow_supercategories.${string:${submitit.job_array.task_index}}}
+  num_images: null
+  supercategory: lsb  # CHANGED: fixed bucket name (no roboflow100 job-array)
 
-  # Training transforms pipeline
   train_transforms:
     - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
       transforms:
         - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
           query_filter:
             _target_: sam3.train.transforms.filter_query_transforms.FilterCrowds
+
         - _target_: sam3.train.transforms.point_sampling.RandomizeInputBbox
-          box_noise_std: 0.1
-          box_noise_max: 20
+          box_noise_std: 0.05   # CHANGED: more conservative for faint LSB objects
+          box_noise_max: 10     # CHANGED: avoid cropping faint regions away
+
         - _target_: sam3.train.transforms.segmentation.DecodeRle
+
+        - _target_: sam3.train.transforms.basic_for_api.RandomHorizontalFlip
+          consistent_transform: ${scratch.consistent_transform}
+          p: 0.5
+
+        - _target_: sam3.train.transforms.basic_for_api.ColorJitter
+          consistent_transform: ${scratch.consistent_transform}
+          brightness: 0.3
+          contrast: 0.3
+          saturation: 0.1
+          hue: 0.0
+
+        - _target_: sam3.train.transforms.basic_for_api.RandomGrayscale
+          consistent_transform: ${scratch.consistent_transform}
+          p: 0.2
+
         - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
           sizes:
             _target_: sam3.train.transforms.basic.get_random_resize_scales
             size: ${scratch.resolution}
-            min_size: 480
+            min_size: 896        # CHANGED: protect thin streams (avoid over-downsample)
             rounded: false
           max_size:
             _target_: sam3.train.transforms.basic.get_random_resize_max_size
             size: ${scratch.resolution}
           square: true
           consistent_transform: ${scratch.consistent_transform}
+
         - _target_: sam3.train.transforms.basic_for_api.PadToSizeAPI
           size: ${scratch.resolution}
           consistent_transform: ${scratch.consistent_transform}
+
         - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+
         - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
           query_filter:
             _target_: sam3.train.transforms.filter_query_transforms.FilterEmptyTargets
+
         - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
           mean: ${scratch.train_norm_mean}
           std: ${scratch.train_norm_std}
+
         - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
           query_filter:
             _target_: sam3.train.transforms.filter_query_transforms.FilterEmptyTargets
+
     - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
       query_filter:
         _target_: sam3.train.transforms.filter_query_transforms.FilterFindQueriesWithTooManyOut
         max_num_objects: ${scratch.max_ann_per_img}
 
-  # Validation transforms pipeline
   val_transforms:
     - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
       transforms:
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
         - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
           sizes: ${scratch.resolution}
           max_size:
@@ -71,7 +96,9 @@ roboflow_train:
           mean: ${scratch.train_norm_mean}
           std: ${scratch.train_norm_std}
 
-  # loss config (no mask loss)
+  # ============================================================================
+  # Loss (LSB baseline: instance masks first, semantic off)
+  # ============================================================================
   loss:
     _target_: sam3.train.loss.sam3_loss.Sam3LossWrapper
     matcher: ${scratch.matcher}
@@ -81,84 +108,55 @@ roboflow_train:
       alpha: 0.3
       threshold: 0.4
       topk: 4
-    use_o2m_matcher_on_o2m_aux: false # Another option is true
+    use_o2m_matcher_on_o2m_aux: false
+
     loss_fns_find:
       - _target_: sam3.train.loss.loss_fns.Boxes
         weight_dict:
           loss_bbox: 5.0
           loss_giou: 2.0
+
       - _target_: sam3.train.loss.loss_fns.IABCEMdetr
         weak_loss: False
         weight_dict:
-          loss_ce: 20.0 # Another option is 100.0
+          loss_ce: 20.0
           presence_loss: 20.0
-        pos_weight: 10.0 # Another option is 5.0
+        pos_weight: 10.0
         alpha: 0.25
         gamma: 2
-        use_presence: True  # Change
+        use_presence: True
         pos_focal: false
         pad_n_queries: 200
         pad_scale_pos: 1.0
 
-    loss_fn_semantic_seg: null
+      - _target_: sam3.train.loss.loss_fns.Masks
+        focal_alpha: 0.25
+        focal_gamma: 2.0
+        weight_dict:
+          loss_mask: 100.0
+          loss_dice: 50.0
+        compute_aux: false
+
+    loss_fn_semantic_seg:
+      _target_: sam3.train.loss.loss_fns.SemanticSegCriterion
+      presence_head: True
+      presence_loss: False
+      focal: True
+      focal_alpha: 0.6
+      focal_gamma: 2.0
+      downsample: False
+      weight_dict:
+        loss_semantic_seg: 20.0
+        loss_semantic_presence: 1.0
+        loss_semantic_dice: 30.0
     scale_by_find_batch_size: ${scratch.scale_by_find_batch_size}
 
-
-  # NOTE: Loss to be used for training in case of segmentation
-  # loss:
-  #   _target_: sam3.train.loss.sam3_loss.Sam3LossWrapper
-  #   matcher: ${scratch.matcher}
-  #   o2m_weight: 2.0
-  #   o2m_matcher:
-  #     _target_: sam3.train.matcher.BinaryOneToManyMatcher
-  #     alpha: 0.3
-  #     threshold: 0.4
-  #     topk: 4
-  #   use_o2m_matcher_on_o2m_aux: false
-  #   loss_fns_find:
-  #     - _target_: sam3.train.loss.loss_fns.Boxes
-  #       weight_dict:
-  #         loss_bbox: 5.0
-  #         loss_giou: 2.0
-  #     - _target_: sam3.train.loss.loss_fns.IABCEMdetr
-  #       weak_loss: False
-  #       weight_dict:
-  #         loss_ce: 20.0 # Another option is 100.0
-  #         presence_loss: 20.0
-  #       pos_weight: 10.0 # Another option is 5.0
-  #       alpha: 0.25
-  #       gamma: 2
-  #       use_presence: True  # Change
-  #       pos_focal: false
-  #       pad_n_queries: 200
-  #       pad_scale_pos: 1.0
-  #     - _target_: sam3.train.loss.loss_fns.Masks
-  #       focal_alpha: 0.25
-  #       focal_gamma: 2.0
-  #       weight_dict:
-  #         loss_mask: 200.0
-  #         loss_dice: 10.0
-  #       compute_aux: false
-  #   loss_fn_semantic_seg:
-  #     _target_: sam3.losses.loss_fns.SemanticSegCriterion
-  #     presence_head: True
-  #     presence_loss: False  # Change
-  #     focal: True
-  #     focal_alpha: 0.6
-  #     focal_gamma: 2.0
-  #     downsample: False
-  #     weight_dict:
-  #       loss_semantic_seg: 20.0
-  #       loss_semantic_presence: 1.0
-  #       loss_semantic_dice: 30.0
-  #   scale_by_find_batch_size: ${scratch.scale_by_find_batch_size}
-
 # ============================================================================
-# Different helper parameters and functions
+# Scratch / helper parameters
 # ============================================================================
 scratch:
-  enable_segmentation: False # NOTE: This is the number of queries used for segmentation
-  # Model parameters
+  enable_segmentation: True
+
   d_model: 256
   pos_embed:
     _target_: sam3.model.position_encoding.PositionEmbeddingSine
@@ -167,39 +165,46 @@ scratch:
     scale: null
     temperature: 10000
 
-  # Box processing
   use_presence_eval: True
   original_box_postprocessor:
     _target_: sam3.eval.postprocessors.PostProcessImage
-    max_dets_per_img: -1  # infinite detections
+    max_dets_per_img: -1
     use_original_ids: true
     use_original_sizes_box: true
     use_presence: ${scratch.use_presence_eval}
 
-  # Matcher configuration
+  # Separate postprocessor for segm eval — iou_type must be "segm"
+  # so that pred_masks are extracted from model outputs
+  original_mask_postprocessor:
+    _target_: sam3.eval.postprocessors.PostProcessImage
+    max_dets_per_img: -1
+    iou_type: "segm"
+    use_original_ids: true
+    use_original_sizes_box: true
+    use_original_sizes_mask: true
+    use_presence: ${scratch.use_presence_eval}
+
   matcher:
     _target_: sam3.train.matcher.BinaryHungarianMatcherV2
-    focal: true  # with `focal: true` it is equivalent to BinaryFocalHungarianMatcher
+    focal: true
     cost_class: 2.0
     cost_bbox: 5.0
     cost_giou: 2.0
     alpha: 0.25
     gamma: 2
     stable: False
+
   scale_by_find_batch_size: True
 
-  # Image processing parameters
   resolution: 1008
   consistent_transform: False
   max_ann_per_img: 200
 
-  # Normalization parameters
   train_norm_mean: [0.5, 0.5, 0.5]
-  train_norm_std: [0.5, 0.5, 0.5]
-  val_norm_mean: [0.5, 0.5, 0.5]
-  val_norm_std: [0.5, 0.5, 0.5]
+  train_norm_std:  [0.5, 0.5, 0.5]
+  val_norm_mean:   [0.5, 0.5, 0.5]
+  val_norm_std:    [0.5, 0.5, 0.5]
 
-  # Training parameters
   num_train_workers: 10
   num_val_workers: 0
   max_data_epochs: 20
@@ -208,10 +213,9 @@ scratch:
   context_length: 2
   gather_pred_via_filesys: false
 
-  # Learning rate and scheduler parameters
   lr_scale: 0.1
   lr_transformer: ${times:8e-4,${scratch.lr_scale}}
-  lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
+  lr_vision_backbone: ${times:2.5e-6,${scratch.lr_scale}}
   lr_language_backbone: ${times:5e-5,${scratch.lr_scale}}
   lrd_vision_backbone: 0.9
   wd: 0.1
@@ -219,38 +223,37 @@ scratch:
   scheduler_warmup: 20
   scheduler_cooldown: 20
 
-  val_batch_size: 1
+  val_batch_size: 4
   collate_fn_val:
     _target_: sam3.train.data.collator.collate_fn_api
     _partial_: true
     repeats: ${scratch.hybrid_repeats}
-    dict_key: roboflow100
-    with_seg_masks: ${scratch.enable_segmentation} # Note: Set this to true if using segmentation masks!
+    dict_key: lsb  # must match meter key
+    with_seg_masks: ${scratch.enable_segmentation}
 
-  gradient_accumulation_steps: 1
-  train_batch_size: 1
+  gradient_accumulation_steps: 4
+  train_batch_size: 4
   collate_fn:
-    _target_: sam3.train.data.collator.collate_fn_api
+    _target_: sam3.train.data.collator.collate_fn_api_with_chunking
     _partial_: true
     repeats: ${scratch.hybrid_repeats}
-    dict_key: all
-    with_seg_masks: ${scratch.enable_segmentation} # Note: Set this to true if using segmentation masks!
+    dict_key: all  # must match loss config key ('all')
+    with_seg_masks: ${scratch.enable_segmentation}
+    num_chunks: ${scratch.gradient_accumulation_steps}
 
 # ============================================================================
-# Trainer Configuration
+# Trainer
 # ============================================================================
-
 trainer:
-
   _target_: sam3.train.trainer.Trainer
-  skip_saving_ckpts: true
+  skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: True
   skip_first_val: True
-  max_epochs: 20
+  max_epochs: 100
   accelerator: cuda
   seed_value: 123
   val_epoch_freq: 10
-  mode: val
+  mode: train
   gradient_accumulation_steps: ${scratch.gradient_accumulation_steps}
 
   distributed:
@@ -277,8 +280,8 @@ trainer:
         max_val_queries: 50000
         training: true
         use_caching: False
-        img_folder: ${paths.roboflow_vl_100_root}/${roboflow_train.supercategory}/train/
-        ann_file: ${paths.roboflow_vl_100_root}/${roboflow_train.supercategory}/train/_annotations.coco.json
+        img_folder: ${paths.roboflow_vl_100_root}/
+        ann_file: ${paths.roboflow_vl_100_root}/annotations_train_active.json
 
       shuffle: True
       batch_size: ${scratch.train_batch_size}
@@ -295,10 +298,10 @@ trainer:
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           include_negatives: true
-          category_chunk_size: 2 # Note: You can increase this based on the memory of your GPU.
+          category_chunk_size: 2
           _partial_: true
-        img_folder: ${paths.roboflow_vl_100_root}/${roboflow_train.supercategory}/test/
-        ann_file: ${paths.roboflow_vl_100_root}/${roboflow_train.supercategory}/test/_annotations.coco.json
+        img_folder: ${paths.roboflow_vl_100_root}/
+        ann_file: ${paths.roboflow_vl_100_root}/annotations_val.json
         transforms: ${roboflow_train.val_transforms}
         max_ann_per_img: 100000
         multiplier: 1
@@ -311,30 +314,43 @@ trainer:
       drop_last: False
       collate_fn: ${scratch.collate_fn_val}
 
-
   model:
     _target_: sam3.model_builder.build_sam3_image_model
     bpe_path: ${paths.bpe_path}
     device: cpus
-    eval_mode: true
-    enable_segmentation: ${scratch.enable_segmentation} # Warning: Enable this if using segmentation.
+    eval_mode: false
+    enable_segmentation: ${scratch.enable_segmentation}
 
   meters:
     val:
-      roboflow100:
-        detection:
+      lsb:  # CHANGED: unified meter bucket key
+        bbox:
           _target_: sam3.eval.coco_writer.PredictionDumper
           iou_type: "bbox"
-          dump_dir: ${launcher.experiment_log_dir}/dumps/roboflow/${roboflow_train.supercategory}
+          dump_dir: ${launcher.experiment_log_dir}/dumps/lsb/bbox
           merge_predictions: True
           postprocessor: ${scratch.original_box_postprocessor}
           gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
           maxdets: 100
           pred_file_evaluators:
             - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
-              gt_path: ${paths.roboflow_vl_100_root}/${roboflow_train.supercategory}/test/_annotations.coco.json
+              gt_path: ${paths.roboflow_vl_100_root}/annotations_val.json
               tide: False
               iou_type: "bbox"
+
+        segm:  # CHANGED: add segmentation evaluation (critical for mask tuning)
+          _target_: sam3.eval.coco_writer.PredictionDumper
+          iou_type: "segm"
+          dump_dir: ${launcher.experiment_log_dir}/dumps/lsb/segm
+          merge_predictions: True
+          postprocessor: ${scratch.original_mask_postprocessor}
+          gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+          maxdets: 100
+          pred_file_evaluators:
+            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+              gt_path: ${paths.roboflow_vl_100_root}/annotations_val.json
+              tide: False
+              iou_type: "segm"
 
   optim:
     amp:
@@ -360,12 +376,13 @@ trainer:
 
     options:
       lr:
-        - scheduler:  # transformer and class_embed
+        - scheduler:
             _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
             base_lr: ${scratch.lr_transformer}
             timescale: ${scratch.scheduler_timescale}
             warmup_steps: ${scratch.scheduler_warmup}
             cooldown_steps: ${scratch.scheduler_cooldown}
+
         - scheduler:
             _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
             base_lr: ${scratch.lr_vision_backbone}
@@ -374,6 +391,7 @@ trainer:
             cooldown_steps: ${scratch.scheduler_cooldown}
           param_names:
             - 'backbone.vision_backbone.*'
+
         - scheduler:
             _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
             base_lr: ${scratch.lr_language_backbone}
@@ -388,7 +406,7 @@ trainer:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: ${scratch.wd}
         - scheduler:
-            _target_: fvcore.common.param_scheduler.ConstantParamSchedulerhybrid_repeats
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: 0.0
           param_names:
             - '*bias*'
@@ -396,7 +414,7 @@ trainer:
 
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
-    save_freq: 0  # 0 only last checkpoint is saved.
+    save_freq: 10
 
   logging:
     tensorboard_writer:
@@ -405,16 +423,15 @@ trainer:
       flush_secs: 120
       should_log: True
     wandb_writer: null
-    log_dir: ${launcher.experiment_log_dir}/logs/${roboflow_train.supercategory}
+    log_dir: ${launcher.experiment_log_dir}/logs/lsb  # CHANGED: no supercategory shards
     log_freq: 10
 
 # ============================================================================
-# Launcher and Submitit Configuration
+# Launcher / Submitit
 # ============================================================================
-
 launcher:
   num_nodes: 1
-  gpus_per_node: 2
+  gpus_per_node: 1
   experiment_log_dir: ${paths.experiment_log_dir}
   multiprocessing_context: forkserver
 
@@ -427,113 +444,3 @@ submitit:
   cpus_per_task: 10
   port_range: [10000, 65000]
   constraint: null
-  # Uncomment for job array configuration
-  job_array:
-    num_tasks: 100
-    task_index: 0
-
-# ============================================================================
-# Available Roboflow Supercategories (for reference)
-# ============================================================================
-
-all_roboflow_supercategories:
-  - -grccs
-  - zebrasatasturias
-  - cod-mw-warzone
-  - canalstenosis
-  - label-printing-defect-version-2
-  - new-defects-in-wood
-  - orionproducts
-  - aquarium-combined
-  - varroa-mites-detection--test-set
-  - clashroyalechardetector
-  - stomata-cells
-  - halo-infinite-angel-videogame
-  - pig-detection
-  - urine-analysis1
-  - aerial-sheep
-  - orgharvest
-  - actions
-  - mahjong
-  - liver-disease
-  - needle-base-tip-min-max
-  - wheel-defect-detection
-  - aircraft-turnaround-dataset
-  - xray
-  - wildfire-smoke
-  - spinefrxnormalvindr
-  - ufba-425
-  - speech-bubbles-detection
-  - train
-  - pill
-  - truck-movement
-  - car-logo-detection
-  - inbreast
-  - sea-cucumbers-new-tiles
-  - uavdet-small
-  - penguin-finder-seg
-  - aerial-airport
-  - bibdetection
-  - taco-trash-annotations-in-context
-  - bees
-  - recode-waste
-  - screwdetectclassification
-  - wine-labels
-  - aerial-cows
-  - into-the-vale
-  - gwhd2021
-  - lacrosse-object-detection
-  - defect-detection
-  - dataconvert
-  - x-ray-id
-  - ball
-  - tube
-  - 2024-frc
-  - crystal-clean-brain-tumors-mri-dataset
-  - grapes-5
-  - human-detection-in-floods
-  - buoy-onboarding
-  - apoce-aerial-photographs-for-object-detection-of-construction-equipment
-  - l10ul502
-  - floating-waste
-  - deeppcb
-  - ism-band-packet-detection
-  - weeds4
-  - invoice-processing
-  - thermal-cheetah
-  - tomatoes-2
-  - marine-sharks
-  - peixos-fish
-  - sssod
-  - aerial-pool
-  - countingpills
-  - asphaltdistressdetection
-  - roboflow-trained-dataset
-  - everdaynew
-  - underwater-objects
-  - soda-bottles
-  - dentalai
-  - jellyfish
-  - deepfruits
-  - activity-diagrams
-  - circuit-voltages
-  - all-elements
-  - macro-segmentation
-  - exploratorium-daphnia
-  - signatures
-  - conveyor-t-shirts
-  - fruitjes
-  - grass-weeds
-  - infraredimageofpowerequipment
-  - 13-lkc01
-  - wb-prova
-  - flir-camera-objects
-  - paper-parts
-  - football-player-detection
-  - trail-camera
-  - smd-components
-  - water-meter
-  - nih-xray
-  - the-dreidel-project
-  - electric-pylon-detection-in-rsi
-  - cable-damage

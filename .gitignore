@@ -151,3 +151,23 @@ Thumbs.db
 # BPE vocabulary files
 *.bpe
 *.vocab
+
+scratch
+scratch/
+demo/
+
+# Cursor IDE
+.cursor/
+
+# Hydra outputs
+outputs/
+
+# Test / debug artifacts
+test_outputs/
+core
+debug_ddp_params.py
+dataloader.py
+
+# SLURM logs (already covered by logs/ above)
+*.out
+*.err

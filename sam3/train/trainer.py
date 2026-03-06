@@ -671,6 +671,9 @@ class Trainer:
         end = time.time()
 
         for data_iter, batch in enumerate(val_loader):
+            # Skip empty batches (all datapoints have no find_queries/images)
+            if batch is None:
+                continue
             # measure data loading time
             data_time.update(time.time() - end)
 
@@ -1070,6 +1073,38 @@ class Trainer:
 
         self.model = instantiate(self.model_conf, _convert_="all")
         print_model_summary(self.model)
+
+        # Freeze unused semantic segmentation head to avoid DDP errors
+        # when loss_fn_semantic_seg is not configured (as in fine-tuning)
+        try:
+            has_semantic_head = (
+                hasattr(self.model, "segmentation_head") 
+                and self.model.segmentation_head is not None
+                and hasattr(self.model.segmentation_head, "semantic_seg_head")
+            )
+            
+            # Check if loss config disables semantic seg
+            is_semantic_loss_disabled = True
+            if self.loss_conf:
+                # Check 'all' key which usually holds the main loss
+                all_loss = self.loss_conf.get("all")
+                if all_loss:
+                    # Support both dict and DictConfig (params can be attributes or keys)
+                    loss_fn = None
+                    if hasattr(all_loss, "get"):
+                        loss_fn = all_loss.get("loss_fn_semantic_seg")
+                    elif hasattr(all_loss, "loss_fn_semantic_seg"):
+                        loss_fn = all_loss.loss_fn_semantic_seg
+                        
+                    if loss_fn is not None:
+                         is_semantic_loss_disabled = False
+            
+            if has_semantic_head and is_semantic_loss_disabled:
+                logging.info("Freezing unused semantic_seg_head parameters for DDP compatibility")
+                for p in self.model.segmentation_head.semantic_seg_head.parameters():
+                    p.requires_grad = False
+        except Exception as e:
+            logging.warning(f"Failed to check/freeze semantic_seg_head: {e}")
 
         self.loss = None
         if self.loss_conf:

@@ -529,22 +529,34 @@ def _load_checkpoint(model, checkpoint_path):
         ckpt = torch.load(f, map_location="cpu", weights_only=True)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
         ckpt = ckpt["model"]
-    sam3_image_ckpt = {
-        k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
-    }
-    if model.inst_interactive_predictor is not None:
-        sam3_image_ckpt.update(
-            {
-                k.replace("tracker.", "inst_interactive_predictor.model."): v
-                for k, v in ckpt.items()
-                if "tracker" in k
-            }
+    has_detector_prefix = any(k.startswith("detector.") for k in ckpt.keys())
+    if has_detector_prefix:
+        # HF-style checkpoints: detector.* and optionally tracker.*
+        sam3_image_ckpt = {
+            k.replace("detector.", ""): v
+            for k, v in ckpt.items()
+            if k.startswith("detector.")
+        }
+        if model.inst_interactive_predictor is not None:
+            sam3_image_ckpt.update(
+                {
+                    k.replace("tracker.", "inst_interactive_predictor.model."): v
+                    for k, v in ckpt.items()
+                    if k.startswith("tracker.")
+                }
+            )
+        missing_keys, unexpected_keys = model.load_state_dict(
+            sam3_image_ckpt, strict=False
         )
-    missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
-    if len(missing_keys) > 0:
+    else:
+        # Trainer-style checkpoints: keys already match model (no detector.* prefix)
+        missing_keys, unexpected_keys = model.load_state_dict(ckpt, strict=False)
+
+    if len(missing_keys) > 0 or len(unexpected_keys) > 0:
         print(
             f"loaded {checkpoint_path} and found "
-            f"missing and/or unexpected keys:\n{missing_keys=}"
+            f"missing and/or unexpected keys:\n"
+            f"{missing_keys=}\n{unexpected_keys=}"
         )
 
 
@@ -615,7 +627,7 @@ def build_sam3_image_model(
     # Create geometry encoder
     input_geometry_encoder = _create_geometry_encoder()
     if enable_inst_interactivity:
-        sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
+        sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False, with_backbone=True, compile_mode=compile_mode)
         inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
     else:
         inst_predictor = None
